@@ -21,6 +21,10 @@ input {
   font: inherit;
 }
 
+button {
+  border: 0;
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;
@@ -36,6 +40,7 @@ input {
   gap: 16px;
 }
 
+.panel-heading,
 .panel-title,
 .section-heading,
 .status-pill,
@@ -45,9 +50,14 @@ input {
   align-items: center;
 }
 
+.panel-heading {
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
 .panel-title {
   gap: 10px;
-  margin-bottom: 6px;
 }
 
 h1,
@@ -113,8 +123,23 @@ input:focus {
 
 .segmented button,
 .composer button {
-  border: 0;
   cursor: pointer;
+}
+
+.icon-button {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: #eef1e9;
+  color: #475248;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  background: #e1e8dc;
+  color: #173b2a;
 }
 
 .segmented button {
@@ -511,4 +536,3 @@ input:focus {
     max-width: 100%;
   }
 }
-

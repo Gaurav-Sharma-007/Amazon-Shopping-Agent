@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import get_settings
-from .models import Product, RankedProduct
+from .models import Product, ProductFilters, RankedProduct
 
 
 class ProductRepository(ABC):
@@ -83,44 +83,84 @@ def build_product_repository() -> ProductRepository:
     return LocalProductRepository()
 
 
-def sample_products(query: str) -> list[Product]:
+def sample_products(query: str, filters: ProductFilters | None = None) -> list[Product]:
     normalized = query or "wireless headphones"
+    preferred_brands = filters.brands if filters else []
+    brands = [
+        preferred_brands[0] if len(preferred_brands) > 0 else "SampleBrand",
+        preferred_brands[1] if len(preferred_brands) > 1 else "ValueLine",
+        preferred_brands[2] if len(preferred_brands) > 2 else "PrimeAudio",
+    ]
+    ratings = _sample_ratings(filters)
+    reviews = _sample_reviews(filters)
+    prices = _sample_prices(filters)
+    prime_values = [True, True, bool(filters.prime_only) if filters else False]
+
     return [
         Product(
             product_id="sample-1",
-            title=f"{normalized.title()} - Balanced Choice",
+            title=f"{brands[0]} {normalized.title()} - Balanced Choice",
             url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
-            price=79.99,
-            rating=4.5,
-            review_count=8421,
+            price=prices[0],
+            rating=ratings[0],
+            review_count=reviews[0],
             image_url=None,
-            brand="SampleBrand",
-            is_prime=True,
+            brand=brands[0],
+            is_prime=prime_values[0],
             raw={"fallback": True},
         ),
         Product(
             product_id="sample-2",
-            title=f"{normalized.title()} - Budget Pick",
+            title=f"{brands[1]} {normalized.title()} - Budget Pick",
             url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
-            price=39.99,
-            rating=4.2,
-            review_count=3120,
+            price=prices[1],
+            rating=ratings[1],
+            review_count=reviews[1],
             image_url=None,
-            brand="ValueLine",
-            is_prime=True,
+            brand=brands[1],
+            is_prime=prime_values[1],
             raw={"fallback": True},
         ),
         Product(
             product_id="sample-3",
-            title=f"{normalized.title()} - Premium Option",
+            title=f"{brands[2]} {normalized.title()} - Premium Option",
             url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
-            price=149.99,
-            rating=4.7,
-            review_count=12650,
+            price=prices[2],
+            rating=ratings[2],
+            review_count=reviews[2],
             image_url=None,
-            brand="PrimeAudio",
-            is_prime=False,
+            brand=brands[2],
+            is_prime=prime_values[2],
             raw={"fallback": True},
         ),
     ]
 
+
+def _sample_ratings(filters: ProductFilters | None) -> list[float]:
+    baseline = [4.5, 4.2, 4.7]
+    if filters and filters.min_rating is not None:
+        return [round(max(value, filters.min_rating), 1) for value in baseline]
+    return baseline
+
+
+def _sample_reviews(filters: ProductFilters | None) -> list[int]:
+    baseline = [8421, 3120, 12650]
+    if filters and filters.min_reviews is not None:
+        return [max(value, filters.min_reviews) for value in baseline]
+    return baseline
+
+
+def _sample_prices(filters: ProductFilters | None) -> list[float]:
+    baseline = [79.99, 39.99, 149.99]
+    if not filters:
+        return baseline
+
+    prices: list[float] = []
+    for index, price in enumerate(baseline):
+        adjusted = price
+        if filters.max_price is not None and adjusted > filters.max_price:
+            adjusted = max(1.0, filters.max_price - (2 * index))
+        if filters.min_price is not None and adjusted < filters.min_price:
+            adjusted = filters.min_price + (8 * index)
+        prices.append(round(adjusted, 2))
+    return prices

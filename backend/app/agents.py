@@ -21,9 +21,23 @@ from .scraper import AmazonCatalogScraper
 from .storage import ProductRepository, build_product_repository
 
 
-PRICE_UNDER_RE = re.compile(r"(?:under|below|less than|max|budget)\s*\$?(\d+(?:\.\d+)?)", re.I)
-PRICE_OVER_RE = re.compile(r"(?:over|above|at least|min)\s*\$?(\d+(?:\.\d+)?)", re.I)
+PRICE_UNDER_RE = re.compile(
+    r"(?:under|below|less than|max|budget)\s*\$?(\d+(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
+    re.I,
+)
+PRICE_OVER_RE = re.compile(
+    r"(?:over|above|at least|min(?:imum)?)\s*\$?(\d+(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
+    re.I,
+)
 RATING_RE = re.compile(r"(\d(?:\.\d)?)\s*(?:star|stars|\+)", re.I)
+RATING_KEYWORD_RE = re.compile(
+    r"(?:min(?:imum)?\s*)?(?:rating|rated)\s*(?:of|at least|above|over)?\s*(\d(?:\.\d)?)",
+    re.I,
+)
+REVIEWS_RE = re.compile(
+    r"(?:(?:at least|min(?:imum)?|over|above)\s*)?(\d[\d,]*)\+?\s*(?:reviews?|ratings?)",
+    re.I,
+)
 
 
 class ProductRecommendationGraph:
@@ -47,9 +61,8 @@ class ProductRecommendationGraph:
         filters = ProductFilters(**previous.get("filters", {}))
 
         incoming = request.filters.model_dump(exclude_unset=True)
-        filters = filters.model_copy(update={k: v for k, v in incoming.items() if v not in (None, "", [])})
-        if request.filters.query:
-            filters.query = request.filters.query
+        if incoming:
+            filters = filters.model_copy(update=incoming)
 
         state: AgentState = {
             "session_id": session_id,
@@ -116,13 +129,16 @@ class ProductRecommendationGraph:
 
         max_match = PRICE_UNDER_RE.search(message)
         min_match = PRICE_OVER_RE.search(message)
-        rating_match = RATING_RE.search(message)
+        rating_match = RATING_RE.search(message) or RATING_KEYWORD_RE.search(message)
+        reviews_match = REVIEWS_RE.search(message)
         if max_match:
             filters.max_price = float(max_match.group(1))
         if min_match:
             filters.min_price = float(min_match.group(1))
         if rating_match:
             filters.min_rating = min(5, float(rating_match.group(1)))
+        if reviews_match:
+            filters.min_reviews = int(reviews_match.group(1).replace(",", ""))
         if "prime" in lower:
             filters.prime_only = True
         if any(word in lower for word in ["cheap", "budget", "affordable"]):
@@ -134,10 +150,20 @@ class ProductRecommendationGraph:
         if extracted_query:
             filters.query = extracted_query
 
-        must_have = _extract_after_keywords(lower, ["with ", "must have ", "need "])
+        must_have = _extract_after_keywords(
+            lower, ["with ", "must have ", "needs to have ", "that has "]
+        )
         for term in must_have:
             if term not in filters.must_have and len(term) <= 40:
                 filters.must_have.append(term)
+
+        for brand in _extract_brands(message):
+            if brand.lower() not in {item.lower() for item in filters.brands}:
+                filters.brands.append(brand)
+
+        for term in _extract_after_keywords(lower, ["avoid ", "without ", "exclude "]):
+            if term not in filters.avoid and len(term) <= 40:
+                filters.avoid.append(term)
 
         trace = state.get("trace", [])
         trace.append("Intent agent converted natural language into query, filters, and preferences.")
@@ -179,10 +205,20 @@ class ProductRecommendationGraph:
 
 
 def _extract_query(message: str) -> str:
-    cleaned = re.sub(r"\b(under|below|less than|max|budget|over|above|at least|min)\s*\$?\d+(\.\d+)?", "", message, flags=re.I)
+    cleaned = PRICE_UNDER_RE.sub("", message)
+    cleaned = PRICE_OVER_RE.sub("", cleaned)
     cleaned = re.sub(r"\b\d(?:\.\d)?\s*(star|stars|\+)\b", "", cleaned, flags=re.I)
+    cleaned = RATING_KEYWORD_RE.sub("", cleaned)
+    cleaned = REVIEWS_RE.sub("", cleaned)
+    cleaned = re.sub(r"\bbrands?\s*(?:are|include|:|=)?\s*[^.;,]+(?:[,;]\s*[^.;,]+)*", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"\bfrom\s+[a-z0-9&\-\s,]+?(?=\s+\b(?:with|under|below|less than|over|above|at least|avoid|without|exclude|rating|reviews?|prime)\b|$)",
+        "",
+        cleaned,
+        flags=re.I,
+    )
     cleaned = re.sub(r"\b(i want|i need|find me|recommend|show me|looking for|best|amazon|prime)\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(with|must have|need)\b.*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(with|must have|avoid|without|exclude)\b.*", "", cleaned, flags=re.I)
     cleaned = " ".join(cleaned.split())
     return cleaned.strip(" ,.-")[:120]
 
@@ -192,9 +228,41 @@ def _extract_after_keywords(message: str, keywords: list[str]) -> list[str]:
     for keyword in keywords:
         if keyword in message:
             tail = message.split(keyword, 1)[1]
-            tail = re.split(r"\b(?:under|below|less than|over|above|at least|for|and avoid)\b", tail)[0]
+            tail = re.split(
+                r"\b(?:under|below|less than|over|above|at least|for|and avoid|minimum|rating|reviews?|brands?)\b",
+                tail,
+            )[0]
             for part in re.split(r",| and ", tail):
                 normalized = part.strip(" .")
                 if normalized and normalized not in {"prime", "amazon prime"} and len(normalized.split()) <= 4:
                     results.append(normalized)
     return results[:5]
+
+
+def _extract_brands(message: str) -> list[str]:
+    match = re.search(
+        r"\bbrands?\s*(?:are|include|:|=)?\s*([a-z0-9][a-z0-9&\-\s,]+)",
+        message,
+        re.I,
+    )
+    if not match:
+        match = re.search(
+            r"\bfrom\s+([a-z0-9][a-z0-9&\-\s,]+)",
+            message,
+            re.I,
+        )
+    if not match:
+        return []
+
+    tail = re.split(
+        r"\b(?:under|below|less than|over|above|at least|with|must have|avoid|without|exclude|rating|reviews?|prime)\b",
+        match.group(1),
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+    brands: list[str] = []
+    for part in re.split(r",|/|\bor\b|\band\b", tail, flags=re.I):
+        brand = " ".join(part.strip(" .:-").split())
+        if brand and len(brand.split()) <= 3:
+            brands.append(brand.upper() if brand.isupper() else brand.title())
+    return brands[:5]

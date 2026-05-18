@@ -5,6 +5,7 @@ import {
   Database,
   Filter,
   Loader2,
+  RotateCcw,
   Search,
   Send,
   SlidersHorizontal,
@@ -43,11 +44,15 @@ function normalizeFilters(filters) {
 }
 
 function numberOrNull(value) {
-  return value === "" ? null : Number(value);
+  if (value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 function intOrNull(value) {
-  return value === "" ? null : Number.parseInt(value, 10);
+  if (value === "") return null;
+  const number = Number.parseInt(value, 10);
+  return Number.isFinite(number) ? number : null;
 }
 
 function splitTerms(value) {
@@ -61,9 +66,7 @@ function App() {
   const [sessionId, setSessionId] = useState(
     () => localStorage.getItem("amazon-recommender-session") || null
   );
-  const [message, setMessage] = useState(
-    "Find me wireless headphones under $100 with noise cancellation"
-  );
+  const [message, setMessage] = useState("");
   const [filters, setFilters] = useState(emptyFilters);
   const [chat, setChat] = useState([]);
   const [recommendation, setRecommendation] = useState(null);
@@ -104,7 +107,16 @@ function App() {
         }),
       });
       if (!response.ok) {
-        throw new Error(`Request failed with ${response.status}`);
+        let detail = "";
+        try {
+          const payload = await response.json();
+          detail = Array.isArray(payload.detail)
+            ? payload.detail.map((item) => item.msg).join(", ")
+            : payload.detail || "";
+        } catch {
+          detail = await response.text();
+        }
+        throw new Error(detail || `Request failed with ${response.status}`);
       }
       const payload = await response.json();
       setSessionId(payload.session_id);
@@ -114,26 +126,17 @@ function App() {
       setTrace(payload.trace);
       setProductsSaved(payload.products_saved);
       setMessage("");
-      setFilters((current) => ({
-        ...current,
-        query: payload.filters.query || current.query,
-        min_price: payload.filters.min_price ?? current.min_price,
-        max_price: payload.filters.max_price ?? current.max_price,
-        min_rating: payload.filters.min_rating ?? current.min_rating,
-        min_reviews: payload.filters.min_reviews ?? current.min_reviews,
-        prime_only: payload.filters.prime_only,
-        sort_goal: payload.filters.sort_goal || current.sort_goal,
-        brands: (payload.filters.brands || []).join(", "),
-        must_have: (payload.filters.must_have || []).join(", "),
-        avoid: (payload.filters.avoid || []).join(", "),
-      }));
     } catch (err) {
-      setError(err.message);
+      const message =
+        err instanceof TypeError
+          ? `Could not reach the backend at ${API_URL}.`
+          : err.message;
+      setError(message);
       setChat((items) => [
         ...items,
         {
           role: "assistant",
-          content: "I could not reach the recommendation backend yet.",
+          content: "I could not complete that recommendation request yet.",
         },
       ]);
     } finally {
@@ -144,17 +147,27 @@ function App() {
   return (
     <main className="app-shell">
       <aside className="filter-panel">
-        <div className="panel-title">
-          <SlidersHorizontal size={20} />
-          <h1>Preference Console</h1>
+        <div className="panel-heading">
+          <div className="panel-title">
+            <SlidersHorizontal size={20} />
+            <h1>Optional Filters</h1>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            title="Clear filters"
+            onClick={() => setFilters(emptyFilters)}
+          >
+            <RotateCcw size={17} />
+          </button>
         </div>
 
         <label>
-          <span>Search Query</span>
+          <span>Keyword Override</span>
           <input
             value={filters.query}
             onChange={(event) => setFilters({ ...filters, query: event.target.value })}
-            placeholder="wireless headphones"
+            placeholder="Optional: wireless headphones"
           />
         </label>
 
@@ -283,7 +296,7 @@ function App() {
               {chat.length === 0 && (
                 <div className="empty-state">
                   <Bot size={36} />
-                  <p>Start with a product category, budget, and deal-breakers.</p>
+                  <p>Describe what you want. Add filters only when they matter.</p>
                 </div>
               )}
               {chat.map((item, index) => (
@@ -299,7 +312,7 @@ function App() {
               <input
                 value={message}
                 onChange={(event) => setMessage(event.target.value)}
-                placeholder="Ask for a product, refine preferences, or change budget"
+                placeholder="Describe a product, or include things like brand, rating, reviews, and price"
               />
               <button type="submit" disabled={loading || !message.trim()} title="Send">
                 {loading ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
@@ -382,4 +395,3 @@ function ProductCard({ product, featured = false }) {
 }
 
 export default App;
-

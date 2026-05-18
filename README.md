@@ -48,7 +48,7 @@ Backend:
 
 ```bash
 source venv/bin/activate
-python main2.py
+python main.py
 ```
 
 Frontend:
@@ -79,4 +79,3 @@ The app uses your normal AWS credential chain for both DynamoDB and Bedrock.
 ## Scraping Notes
 
 The Playwright scraper only reads public search result pages. It does not log in, bypass captcha, or evade access controls. In development, if Playwright or Amazon access fails, the backend returns deterministic sample products so the rest of the agent, ranking, memory, and UI flow remains testable.
-

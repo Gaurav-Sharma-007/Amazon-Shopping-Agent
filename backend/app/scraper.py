@@ -49,7 +49,7 @@ class AmazonCatalogScraper:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            return sample_products(query)
+            return sample_products(query, filters)
 
         try:
             async with async_playwright() as p:
@@ -80,9 +80,9 @@ class AmazonCatalogScraper:
 
                 await browser.close()
         except Exception:
-            return sample_products(query)
+            return sample_products(query, filters)
 
-        return products or sample_products(query)
+        return products or sample_products(query, filters)
 
     async def _extract_card(self, card, domain: str) -> Product | None:
         title = await self._first_text(
