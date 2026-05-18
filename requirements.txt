@@ -3,5 +3,4 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
 langgraph>=0.2.20
 playwright>=1.46.0
-boto3>=1.34.0
-
+boto3>=1.43.0

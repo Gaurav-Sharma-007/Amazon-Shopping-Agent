@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .marketplaces import DEFAULT_MARKETPLACE_CODE, normalize_marketplace_code
 
 
 class ProductFilters(BaseModel):
     query: str = ""
+    marketplace: str = DEFAULT_MARKETPLACE_CODE
     min_price: float | None = None
     max_price: float | None = None
     min_rating: float | None = Field(default=None, ge=0, le=5)
@@ -17,6 +20,11 @@ class ProductFilters(BaseModel):
     must_have: list[str] = Field(default_factory=list)
     avoid: list[str] = Field(default_factory=list)
     sort_goal: Literal["best_match", "value", "rating", "budget"] = "best_match"
+
+    @field_validator("marketplace", mode="before")
+    @classmethod
+    def normalize_marketplace(cls, value: str | None) -> str:
+        return normalize_marketplace_code(value)
 
 
 class ChatMessage(BaseModel):
@@ -32,6 +40,8 @@ class Product(BaseModel):
     title: str
     url: str
     price: float | None = None
+    currency_code: str = "USD"
+    currency_symbol: str = "$"
     rating: float | None = None
     review_count: int | None = None
     image_url: str | None = None
@@ -84,4 +94,3 @@ class AgentState(TypedDict, total=False):
     recommendation: dict[str, Any]
     trace: list[str]
     products_saved: int
-

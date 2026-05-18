@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
 import {
   Bot,
   CheckCircle2,
@@ -15,8 +15,37 @@ import {
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
+const AMAZON_MARKETPLACES = [
+  { code: "US", country: "United States", domain: "amazon.com", region: "Americas" },
+  { code: "CA", country: "Canada", domain: "amazon.ca", region: "Americas" },
+  { code: "MX", country: "Mexico", domain: "amazon.com.mx", region: "Americas" },
+  { code: "BR", country: "Brazil", domain: "amazon.com.br", region: "Americas" },
+  { code: "UK", country: "United Kingdom", domain: "amazon.co.uk", region: "Europe" },
+  { code: "FR", country: "France", domain: "amazon.fr", region: "Europe" },
+  { code: "BE", country: "Belgium", domain: "amazon.com.be", region: "Europe" },
+  { code: "ES", country: "Spain", domain: "amazon.es", region: "Europe" },
+  { code: "DE", country: "Germany", domain: "amazon.de", region: "Europe" },
+  { code: "IE", country: "Ireland", domain: "amazon.ie", region: "Europe" },
+  { code: "IT", country: "Italy", domain: "amazon.it", region: "Europe" },
+  { code: "NL", country: "Netherlands", domain: "amazon.nl", region: "Europe" },
+  { code: "PL", country: "Poland", domain: "amazon.pl", region: "Europe" },
+  { code: "SE", country: "Sweden", domain: "amazon.se", region: "Europe" },
+  { code: "TR", country: "Turkey", domain: "amazon.com.tr", region: "Europe" },
+  { code: "AU", country: "Australia", domain: "amazon.com.au", region: "Asia-Pacific" },
+  { code: "IN", country: "India", domain: "amazon.in", region: "Asia-Pacific" },
+  { code: "JP", country: "Japan", domain: "amazon.co.jp", region: "Asia-Pacific" },
+  { code: "SG", country: "Singapore", domain: "amazon.sg", region: "Asia-Pacific" },
+  { code: "AE", country: "United Arab Emirates", domain: "amazon.ae", region: "Middle East and North Africa" },
+  { code: "SA", country: "Saudi Arabia", domain: "amazon.sa", region: "Middle East and North Africa" },
+  { code: "EG", country: "Egypt", domain: "amazon.eg", region: "Middle East and North Africa" },
+  { code: "ZA", country: "South Africa", domain: "amazon.co.za", region: "Africa" },
+];
+
+const MARKETPLACE_REGIONS = [...new Set(AMAZON_MARKETPLACES.map((item) => item.region))];
+
 const emptyFilters = {
   query: "",
+  marketplace: "US",
   min_price: "",
   max_price: "",
   min_rating: "",
@@ -29,18 +58,28 @@ const emptyFilters = {
 };
 
 function normalizeFilters(filters) {
-  return {
-    query: filters.query.trim(),
-    min_price: numberOrNull(filters.min_price),
-    max_price: numberOrNull(filters.max_price),
-    min_rating: numberOrNull(filters.min_rating),
-    min_reviews: intOrNull(filters.min_reviews),
-    prime_only: filters.prime_only,
-    brands: splitTerms(filters.brands),
-    must_have: splitTerms(filters.must_have),
-    avoid: splitTerms(filters.avoid),
-    sort_goal: filters.sort_goal,
-  };
+  const normalized = {};
+  const query = filters.query.trim();
+  const brands = splitTerms(filters.brands);
+  const mustHave = splitTerms(filters.must_have);
+  const avoid = splitTerms(filters.avoid);
+  const minPrice = numberOrNull(filters.min_price);
+  const maxPrice = numberOrNull(filters.max_price);
+  const minRating = numberOrNull(filters.min_rating);
+  const minReviews = intOrNull(filters.min_reviews);
+
+  if (query) normalized.query = query;
+  if (filters.marketplace !== "US") normalized.marketplace = filters.marketplace;
+  if (minPrice != null) normalized.min_price = minPrice;
+  if (maxPrice != null) normalized.max_price = maxPrice;
+  if (minRating != null) normalized.min_rating = minRating;
+  if (minReviews != null) normalized.min_reviews = minReviews;
+  if (filters.prime_only) normalized.prime_only = true;
+  if (brands.length) normalized.brands = brands;
+  if (mustHave.length) normalized.must_have = mustHave;
+  if (avoid.length) normalized.avoid = avoid;
+  if (filters.sort_goal !== "best_match") normalized.sort_goal = filters.sort_goal;
+  return normalized;
 }
 
 function numberOrNull(value) {
@@ -62,6 +101,22 @@ function splitTerms(value) {
     .filter(Boolean);
 }
 
+function formatPrice(product) {
+  if (product.price == null) return "";
+  if (product.currency_code) {
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: "currency",
+        currency: product.currency_code,
+        maximumFractionDigits: ["INR", "JPY"].includes(product.currency_code) ? 0 : 2,
+      }).format(product.price);
+    } catch {
+      // Fall through to the marketplace symbol below.
+    }
+  }
+  return `${product.currency_symbol || "$"}${Number(product.price).toLocaleString()}`;
+}
+
 function App() {
   const [sessionId, setSessionId] = useState(
     () => localStorage.getItem("amazon-recommender-session") || null
@@ -81,6 +136,7 @@ function App() {
     () =>
       Object.entries(filters).filter(([key, value]) => {
         if (key === "sort_goal") return value !== "best_match";
+        if (key === "marketplace") return value !== "US";
         if (typeof value === "boolean") return value;
         return String(value).trim().length > 0;
       }).length,
@@ -126,6 +182,10 @@ function App() {
       setTrace(payload.trace);
       setProductsSaved(payload.products_saved);
       setMessage("");
+      setFilters((current) => ({
+        ...current,
+        marketplace: payload.filters.marketplace || current.marketplace,
+      }));
     } catch (err) {
       const message =
         err instanceof TypeError
@@ -161,6 +221,25 @@ function App() {
             <RotateCcw size={17} />
           </button>
         </div>
+
+        <label>
+          <span>Amazon Region</span>
+          <select
+            value={filters.marketplace}
+            onChange={(event) => setFilters({ ...filters, marketplace: event.target.value })}
+            required
+          >
+            {MARKETPLACE_REGIONS.map((region) => (
+              <optgroup key={region} label={region}>
+                {AMAZON_MARKETPLACES.filter((item) => item.region === region).map((item) => (
+                  <option key={item.code} value={item.code}>
+                    {item.country} - {item.domain}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </label>
 
         <label>
           <span>Keyword Override</span>
@@ -376,7 +455,7 @@ function ProductCard({ product, featured = false }) {
           <strong>{Math.round(product.score)}</strong>
         </div>
         <div className="product-meta">
-          {product.price != null && <span>${product.price.toFixed(2)}</span>}
+          {product.price != null && <span>{formatPrice(product)}</span>}
           {product.rating != null && <span>{product.rating.toFixed(1)} stars</span>}
           {product.review_count != null && <span>{product.review_count.toLocaleString()} reviews</span>}
           {product.is_prime && <span>Prime</span>}

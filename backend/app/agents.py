@@ -6,6 +6,11 @@ from langgraph.graph import END, StateGraph
 
 from .llm import RecommendationLLM
 from .memory import SessionMemory
+from .marketplaces import (
+    find_marketplace_in_text,
+    marketplace_label,
+    strip_marketplace_terms,
+)
 from .models import (
     AgentState,
     ChatMessage,
@@ -22,11 +27,15 @@ from .storage import ProductRepository, build_product_repository
 
 
 PRICE_UNDER_RE = re.compile(
-    r"(?:under|below|less than|max|budget)\s*\$?(\d+(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
+    r"(?:under|below|less than|max|budget)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
     re.I,
 )
 PRICE_OVER_RE = re.compile(
-    r"(?:over|above|at least|min(?:imum)?)\s*\$?(\d+(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
+    r"(?:over|above|at least|min(?:imum)?)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
+    re.I,
+)
+PRICE_RANGE_RE = re.compile(
+    r"(?:price\s*)?(?:range\s*)?(?:of|between|from)?\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)\s*(?:to|-|and)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)",
     re.I,
 )
 RATING_RE = re.compile(r"(\d(?:\.\d)?)\s*(?:star|stars|\+)", re.I)
@@ -36,6 +45,31 @@ RATING_KEYWORD_RE = re.compile(
 )
 REVIEWS_RE = re.compile(
     r"(?:(?:at least|min(?:imum)?|over|above)\s*)?(\d[\d,]*)\+?\s*(?:reviews?|ratings?)",
+    re.I,
+)
+COLOR_WORDS = {
+    "black",
+    "white",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "pink",
+    "purple",
+    "violet",
+    "orange",
+    "brown",
+    "grey",
+    "gray",
+    "silver",
+    "gold",
+    "golden",
+    "beige",
+    "cream",
+    "transparent",
+}
+REFINEMENT_RE = re.compile(
+    r"\b(change|switch|make|same|instead|only|just|update|modify|replace)\b",
     re.I,
 )
 
@@ -127,14 +161,23 @@ class ProductRecommendationGraph:
         message = state["user_message"]
         lower = message.lower()
 
+        range_match = PRICE_RANGE_RE.search(message)
         max_match = PRICE_UNDER_RE.search(message)
         min_match = PRICE_OVER_RE.search(message)
         rating_match = RATING_RE.search(message) or RATING_KEYWORD_RE.search(message)
         reviews_match = REVIEWS_RE.search(message)
-        if max_match:
-            filters.max_price = float(max_match.group(1))
-        if min_match:
-            filters.min_price = float(min_match.group(1))
+        marketplace = find_marketplace_in_text(message)
+        if marketplace:
+            filters.marketplace = marketplace
+        if range_match:
+            low = float(range_match.group(1).replace(",", ""))
+            high = float(range_match.group(2).replace(",", ""))
+            filters.min_price = min(low, high)
+            filters.max_price = max(low, high)
+        elif max_match:
+            filters.max_price = float(max_match.group(1).replace(",", ""))
+        if min_match and not range_match:
+            filters.min_price = float(min_match.group(1).replace(",", ""))
         if rating_match:
             filters.min_rating = min(5, float(rating_match.group(1)))
         if reviews_match:
@@ -146,8 +189,17 @@ class ProductRecommendationGraph:
         if any(word in lower for word in ["value", "best for money", "worth"]):
             filters.sort_goal = "value"
 
+        colors = _extract_colors(message)
+        if colors:
+            filters.must_have = [
+                item for item in filters.must_have if item.lower() not in COLOR_WORDS
+            ]
+            for color in colors:
+                if color not in filters.must_have:
+                    filters.must_have.append(color)
+
         extracted_query = _extract_query(message)
-        if extracted_query:
+        if extracted_query and not _is_refinement_message(message, extracted_query, filters.query):
             filters.query = extracted_query
 
         must_have = _extract_after_keywords(
@@ -166,7 +218,10 @@ class ProductRecommendationGraph:
                 filters.avoid.append(term)
 
         trace = state.get("trace", [])
-        trace.append("Intent agent converted natural language into query, filters, and preferences.")
+        trace.append(
+            "Intent agent converted natural language into query, filters, "
+            f"preferences, and marketplace: {marketplace_label(filters.marketplace)}."
+        )
         return {**state, "filters": filters.model_dump(), "search_query": filters.query, "trace": trace}
 
     async def _scraping_agent(self, state: AgentState) -> AgentState:
@@ -200,13 +255,18 @@ class ProductRecommendationGraph:
         ranked = [RankedProduct(**product) for product in state.get("ranked_products", [])]
         recommendation = await self.llm.explain(filters, ranked)
         trace = state.get("trace", [])
-        trace.append("Recommendation LLM produced explainable output from ranked product evidence.")
+        trace.append(self.llm.last_status)
         return {**state, "recommendation": recommendation.model_dump(), "trace": trace}
 
 
 def _extract_query(message: str) -> str:
-    cleaned = PRICE_UNDER_RE.sub("", message)
+    cleaned = strip_marketplace_terms(message)
+    cleaned = PRICE_RANGE_RE.sub("", cleaned)
+    cleaned = PRICE_UNDER_RE.sub("", cleaned)
     cleaned = PRICE_OVER_RE.sub("", cleaned)
+    cleaned = re.sub(r"\b(?:in|under|un)\s+the\s+price\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bprice\s+range\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bun\s+the\b", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b\d(?:\.\d)?\s*(star|stars|\+)\b", "", cleaned, flags=re.I)
     cleaned = RATING_KEYWORD_RE.sub("", cleaned)
     cleaned = REVIEWS_RE.sub("", cleaned)
@@ -218,6 +278,11 @@ def _extract_query(message: str) -> str:
         flags=re.I,
     )
     cleaned = re.sub(r"\b(i want|i need|find me|recommend|show me|looking for|best|amazon|prime)\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(change|switch|make|update|modify|replace)\s+(the\s+)?colou?r\s+(to\s+)?\w+\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(colou?r)\s+(to\s+)?\w+\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b(colou?red|color)\b", "", cleaned, flags=re.I)
+    for color in COLOR_WORDS:
+        cleaned = re.sub(rf"\b{re.escape(color)}\b", "", cleaned, flags=re.I)
     cleaned = re.sub(r"\b(with|must have|avoid|without|exclude)\b.*", "", cleaned, flags=re.I)
     cleaned = " ".join(cleaned.split())
     return cleaned.strip(" ,.-")[:120]
@@ -266,3 +331,21 @@ def _extract_brands(message: str) -> list[str]:
         if brand and len(brand.split()) <= 3:
             brands.append(brand.upper() if brand.isupper() else brand.title())
     return brands[:5]
+
+
+def _extract_colors(message: str) -> list[str]:
+    lowered = message.lower()
+    colors = [color for color in COLOR_WORDS if re.search(rf"\b{re.escape(color)}\b", lowered)]
+    return sorted(colors, key=lambda color: lowered.index(color))[:3]
+
+
+def _is_refinement_message(message: str, extracted_query: str, current_query: str) -> bool:
+    if not current_query:
+        return False
+    lowered_query = extracted_query.lower()
+    if REFINEMENT_RE.search(message):
+        return True
+    if lowered_query in COLOR_WORDS:
+        return True
+    non_product_terms = COLOR_WORDS | {"color", "colour", "colored", "coloured"}
+    return bool(lowered_query) and all(token in non_product_terms for token in lowered_query.split())

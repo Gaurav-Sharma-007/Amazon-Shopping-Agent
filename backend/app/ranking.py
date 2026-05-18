@@ -16,6 +16,9 @@ def rank_products(products: list[Product], filters: ProductFilters) -> list[Rank
 
     ranked: list[RankedProduct] = []
     for product in products:
+        if not _satisfies_hard_filters(product, filters):
+            continue
+
         rating_score = ((product.rating or 3.5) / 5) * 30
         review_score = min(math.log10((product.review_count or 1) + 1) / 5, 1) * 20
         price_score = _price_score(product.price, min_price, spread, filters.sort_goal)
@@ -42,6 +45,53 @@ def rank_products(products: list[Product], filters: ProductFilters) -> list[Rank
         )
 
     return sorted(ranked, key=lambda item: item.score, reverse=True)
+
+
+def _satisfies_hard_filters(product: Product, filters: ProductFilters) -> bool:
+    if filters.min_price is not None and (product.price is None or product.price < filters.min_price):
+        return False
+    if filters.max_price is not None and (product.price is None or product.price > filters.max_price):
+        return False
+    if filters.min_rating is not None and (product.rating is None or product.rating < filters.min_rating):
+        return False
+    if filters.min_reviews is not None and (
+        product.review_count is None or product.review_count < filters.min_reviews
+    ):
+        return False
+    if filters.prime_only and not product.is_prime:
+        return False
+    if filters.brands:
+        if not product.brand:
+            return False
+        if product.brand.lower() not in {brand.lower() for brand in filters.brands}:
+            return False
+    title = product.title.lower()
+    if any(term.lower() in title for term in filters.avoid):
+        return False
+    for term in filters.must_have:
+        if term.lower() in {
+            "black",
+            "white",
+            "red",
+            "blue",
+            "green",
+            "yellow",
+            "pink",
+            "purple",
+            "violet",
+            "orange",
+            "brown",
+            "grey",
+            "gray",
+            "silver",
+            "gold",
+            "golden",
+            "beige",
+            "cream",
+            "transparent",
+        } and not _matches_term(term, title):
+            return False
+    return True
 
 
 def _price_score(price: float | None, min_price: float, spread: float, goal: str) -> float:
@@ -99,9 +149,14 @@ def _default_reasons(product: Product, filters: ProductFilters) -> list[str]:
         reasons.append(f"{product.review_count:,} reviews give useful signal")
     if product.price is not None:
         if filters.max_price and product.price <= filters.max_price:
-            reasons.append(f"Inside your budget at ${product.price:.2f}")
+            reasons.append(f"Inside your budget at {_format_price(product)}")
         else:
-            reasons.append(f"Listed around ${product.price:.2f}")
+            reasons.append(f"Listed around {_format_price(product)}")
     if product.is_prime:
         reasons.append("Prime indicator found in listing")
     return reasons
+
+
+def _format_price(product: Product) -> str:
+    decimals = 0 if product.currency_code in {"INR", "JPY"} else 2
+    return f"{product.currency_symbol}{product.price:,.{decimals}f}"

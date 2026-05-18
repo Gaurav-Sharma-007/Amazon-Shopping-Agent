@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import get_settings
+from .marketplaces import marketplace_currency, marketplace_domain
 from .models import Product, ProductFilters, RankedProduct
 
 
@@ -85,6 +86,8 @@ def build_product_repository() -> ProductRepository:
 
 def sample_products(query: str, filters: ProductFilters | None = None) -> list[Product]:
     normalized = query or "wireless headphones"
+    domain = marketplace_domain(filters.marketplace if filters else None)
+    currency_code, currency_symbol = marketplace_currency(filters.marketplace if filters else None)
     preferred_brands = filters.brands if filters else []
     brands = [
         preferred_brands[0] if len(preferred_brands) > 0 else "SampleBrand",
@@ -100,38 +103,44 @@ def sample_products(query: str, filters: ProductFilters | None = None) -> list[P
         Product(
             product_id="sample-1",
             title=f"{brands[0]} {normalized.title()} - Balanced Choice",
-            url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
+            url=f"{domain}/s?k=" + normalized.replace(" ", "+"),
             price=prices[0],
+            currency_code=currency_code,
+            currency_symbol=currency_symbol,
             rating=ratings[0],
             review_count=reviews[0],
             image_url=None,
             brand=brands[0],
             is_prime=prime_values[0],
-            raw={"fallback": True},
+            raw={"fallback": True, "marketplace_domain": domain},
         ),
         Product(
             product_id="sample-2",
             title=f"{brands[1]} {normalized.title()} - Budget Pick",
-            url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
+            url=f"{domain}/s?k=" + normalized.replace(" ", "+"),
             price=prices[1],
+            currency_code=currency_code,
+            currency_symbol=currency_symbol,
             rating=ratings[1],
             review_count=reviews[1],
             image_url=None,
             brand=brands[1],
             is_prime=prime_values[1],
-            raw={"fallback": True},
+            raw={"fallback": True, "marketplace_domain": domain},
         ),
         Product(
             product_id="sample-3",
             title=f"{brands[2]} {normalized.title()} - Premium Option",
-            url="https://www.amazon.com/s?k=" + normalized.replace(" ", "+"),
+            url=f"{domain}/s?k=" + normalized.replace(" ", "+"),
             price=prices[2],
+            currency_code=currency_code,
+            currency_symbol=currency_symbol,
             rating=ratings[2],
             review_count=reviews[2],
             image_url=None,
             brand=brands[2],
             is_prime=prime_values[2],
-            raw={"fallback": True},
+            raw={"fallback": True, "marketplace_domain": domain},
         ),
     ]
 

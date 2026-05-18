@@ -6,11 +6,12 @@ import re
 from urllib.parse import quote_plus, urljoin
 
 from .config import get_settings
+from .marketplaces import marketplace_currency, marketplace_domain
 from .models import Product, ProductFilters
 from .storage import sample_products
 
 
-PRICE_RE = re.compile(r"(\d+(?:,\d{3})*(?:\.\d{2})?)")
+PRICE_RE = re.compile(r"(\d[\d,]*(?:\.\d{1,2})?)")
 RATING_RE = re.compile(r"([0-5](?:\.\d)?)\s+out of 5")
 REVIEWS_RE = re.compile(r"(\d[\d,]*)")
 
@@ -18,7 +19,7 @@ REVIEWS_RE = re.compile(r"(\d[\d,]*)")
 def _parse_price(value: str | None) -> float | None:
     if not value:
         return None
-    match = PRICE_RE.search(value.replace("\n", "."))
+    match = PRICE_RE.search(value.replace("\n", " "))
     if not match:
         return None
     return float(match.group(1).replace(",", ""))
@@ -44,7 +45,10 @@ class AmazonCatalogScraper:
     async def search(self, filters: ProductFilters) -> list[Product]:
         settings = get_settings()
         query = filters.query.strip() or "wireless headphones"
+        domain = marketplace_domain(filters.marketplace)
+        currency_code, currency_symbol = marketplace_currency(filters.marketplace)
         products: list[Product] = []
+        extracted_count = 0
 
         try:
             from playwright.async_api import async_playwright
@@ -59,7 +63,7 @@ class AmazonCatalogScraper:
 
                 for page_number in range(1, settings.scraper_max_pages + 1):
                     url = (
-                        f"{settings.amazon_domain}/s?k={quote_plus(query)}"
+                        f"{domain}/s?k={quote_plus(query)}"
                         f"&page={page_number}"
                     )
                     await page.goto(url, wait_until="domcontentloaded")
@@ -70,7 +74,14 @@ class AmazonCatalogScraper:
                     for index in range(count):
                         if len(products) >= settings.scraper_max_results:
                             break
-                        product = await self._extract_card(cards.nth(index), settings.amazon_domain)
+                        product = await self._extract_card(
+                            cards.nth(index),
+                            domain,
+                            currency_code,
+                            currency_symbol,
+                        )
+                        if product:
+                            extracted_count += 1
                         if product and self._passes_filters(product, filters):
                             products.append(product)
 
@@ -80,11 +91,17 @@ class AmazonCatalogScraper:
 
                 await browser.close()
         except Exception:
-            return sample_products(query, filters)
+            return []
 
-        return products or sample_products(query, filters)
+        return products if extracted_count else []
 
-    async def _extract_card(self, card, domain: str) -> Product | None:
+    async def _extract_card(
+        self,
+        card,
+        domain: str,
+        currency_code: str,
+        currency_symbol: str,
+    ) -> Product | None:
         title = await self._first_text(
             card,
             [
@@ -142,12 +159,18 @@ class AmazonCatalogScraper:
             title=" ".join(title.split()),
             url=url,
             price=_parse_price(price_text),
+            currency_code=currency_code,
+            currency_symbol=currency_symbol,
             rating=_parse_rating(rating_text),
             review_count=_parse_reviews(reviews_text),
             image_url=image_url,
             brand=self._guess_brand(title),
             is_prime=bool(prime_text),
-            raw={"price_text": price_text, "rating_text": rating_text},
+            raw={
+                "price_text": price_text,
+                "rating_text": rating_text,
+                "marketplace_domain": domain,
+            },
         )
 
     async def _first_text(self, card, selectors: list[str]) -> str | None:
@@ -175,21 +198,23 @@ class AmazonCatalogScraper:
         return None
 
     def _passes_filters(self, product: Product, filters: ProductFilters) -> bool:
-        if filters.min_price is not None and product.price is not None:
-            if product.price < filters.min_price:
+        if filters.min_price is not None:
+            if product.price is None or product.price < filters.min_price:
                 return False
-        if filters.max_price is not None and product.price is not None:
-            if product.price > filters.max_price:
+        if filters.max_price is not None:
+            if product.price is None or product.price > filters.max_price:
                 return False
-        if filters.min_rating is not None and product.rating is not None:
-            if product.rating < filters.min_rating:
+        if filters.min_rating is not None:
+            if product.rating is None or product.rating < filters.min_rating:
                 return False
-        if filters.min_reviews is not None and product.review_count is not None:
-            if product.review_count < filters.min_reviews:
+        if filters.min_reviews is not None:
+            if product.review_count is None or product.review_count < filters.min_reviews:
                 return False
         if filters.prime_only and not product.is_prime:
             return False
-        if filters.brands and product.brand:
+        if filters.brands:
+            if not product.brand:
+                return False
             brands = {brand.lower() for brand in filters.brands}
             if product.brand.lower() not in brands:
                 return False

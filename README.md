@@ -6,7 +6,7 @@ AI-assisted product narrowing tool with a React chat UI, filters, a LangGraph ag
 
 Frontend UI:
 - React + Vite chat workspace
-- Structured filters for price, rating, reviews, brand, Prime, must-have, avoid, and ranking goal
+- Required Amazon region selector plus structured filters for price, rating, reviews, brand, Prime, must-have, avoid, and ranking goal
 
 Backend:
 - FastAPI exposes `POST /api/chat`
@@ -78,4 +78,4 @@ The app uses your normal AWS credential chain for both DynamoDB and Bedrock.
 
 ## Scraping Notes
 
-The Playwright scraper only reads public search result pages. It does not log in, bypass captcha, or evade access controls. In development, if Playwright or Amazon access fails, the backend returns deterministic sample products so the rest of the agent, ranking, memory, and UI flow remains testable.
+The Playwright scraper only reads public search result pages for the selected Amazon region. It does not log in, bypass captcha, or evade access controls. In development, if Playwright or Amazon access fails, the backend returns deterministic sample products so the rest of the agent, ranking, memory, and UI flow remains testable.
