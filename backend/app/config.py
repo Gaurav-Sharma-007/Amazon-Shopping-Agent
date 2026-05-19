@@ -13,11 +13,11 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 
 class Settings(BaseModel):
     app_name: str = "Amazon Preference Recommender"
-    aws_region: str = "us-east-1"
+    aws_region: str = "ap-south-1"
     dynamodb_table: str = "amazon-product-recommendations"
-    use_dynamodb: bool = False
+    use_dynamodb: bool = True
     bedrock_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    amazon_domain: str = "https://www.amazon.com"
+    amazon_domain: str = "https://www.amazon.in"
     scraper_max_pages: int = Field(default=1, ge=1, le=5)
     scraper_max_results: int = Field(default=12, ge=1, le=48)
     scraper_timeout_ms: int = Field(default=25_000, ge=5_000, le=90_000)
