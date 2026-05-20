@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Minimum relevance score (0–10) to keep a product.
-RELEVANCE_THRESHOLD = 4.0
+# Kept intentionally low so border-line products still reach the ranker.
+# The ranker (not this filter) is responsible for ordering by quality.
+RELEVANCE_THRESHOLD = 2.5
 
 _SYSTEM_PROMPT = """You are a product relevance judge for an Amazon recommender system.
 You will receive a user's search intent (SearchSpec) and a list of product candidates.
@@ -38,15 +40,19 @@ Output ONLY a JSON array, one entry per product, in the SAME ORDER as input:
   ...
 ]
 
-Scoring guide:
-10 — Perfect match (right category, all keywords, brand, price range, Prime if required)
-7–9 — Good match (minor attribute gap)
-4–6 — Partial match (category ok, missing some features)
-1–3 — Weak match (tangentially related)
-0   — Completely irrelevant
+Scoring guide — be GENEROUS; this is a pre-filter, not the final rank:
+10 — Perfect match (right category, all keywords, brand)
+7–9 — Very good match (right category, most features match)
+5–6 — Acceptable match (correct category, some features match)
+3–4 — Weak but related (category adjacent, could be useful)
+1–2 — Tangentially related — only score 1-2 for clearly wrong categories
+0   — Completely irrelevant (e.g. a phone case when headphones were asked for)
 
-Use the must_have_keywords list to penalise missing features.
-Use the avoid_keywords list to score 0 if any appear in the title.
+Important rules:
+- Default to scoring 5 or above when in doubt — prefer to keep products.
+- Only use must_have_keywords to penalise if they are completely absent AND critical.
+- Score 0 only for avoid_keywords that actually appear in the product title.
+- Do NOT penalise missing minor attributes heavily; save that for the ranker.
 Return ONLY the JSON array, nothing else.
 """
 
@@ -73,9 +79,10 @@ class LLMRelevanceFilter:
             scored = self._keyword_fallback(products, spec)
 
         relevant = [p for p in scored if p.is_relevant]
-        # Keep at least 3 products so ranking has something to work with
-        if len(relevant) < 3 and scored:
-            relevant = sorted(scored, key=lambda p: p.relevance_score, reverse=True)[:3]
+        # Always pass at least 5 products to the ranker so it has a meaningful
+        # pool to work with, even if the LLM scored everything conservatively.
+        if len(relevant) < 5 and scored:
+            relevant = sorted(scored, key=lambda p: p.relevance_score, reverse=True)[:5]
             for p in relevant:
                 p.is_relevant = True
 

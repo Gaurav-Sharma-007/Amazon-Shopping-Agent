@@ -152,6 +152,13 @@ class LLMQueryPlanner:
                     "role": role,
                     "content": [{"text": msg.get("content", "")}],
                 })
+
+        # Bedrock Converse API requires the FIRST message to have role "user".
+        # Session history may start with an assistant turn — drop leading
+        # assistant messages until the list opens with a user message.
+        while conversation and conversation[0]["role"] != "user":
+            conversation.pop(0)
+
         conversation.append({
             "role": "user",
             "content": [{"text": user_message}],
