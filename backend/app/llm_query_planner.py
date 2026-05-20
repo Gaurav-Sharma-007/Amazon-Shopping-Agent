@@ -144,6 +144,14 @@ class LLMQueryPlanner:
         except ImportError:
             return None
 
+        model_id: str = self._settings.bedrock_model_id
+        client = boto3.client("bedrock-runtime", region_name=self._settings.aws_region)
+        is_claude = "anthropic" in model_id.lower() or "claude" in model_id.lower()
+
+        # ----------------------------------------------------------------
+        # Build a shared conversation list (Converse-API format).
+        # The Messages-API path converts this on the fly.
+        # ----------------------------------------------------------------
         conversation: list[dict] = []
         for msg in session_messages[-6:]:  # last 3 turns for context
             role = msg.get("role", "user")
@@ -153,9 +161,7 @@ class LLMQueryPlanner:
                     "content": [{"text": msg.get("content", "")}],
                 })
 
-        # Bedrock Converse API requires the FIRST message to have role "user".
-        # Session history may start with an assistant turn — drop leading
-        # assistant messages until the list opens with a user message.
+        # Both APIs require the first message to have role "user".
         while conversation and conversation[0]["role"] != "user":
             conversation.pop(0)
 
@@ -164,23 +170,77 @@ class LLMQueryPlanner:
             "content": [{"text": user_message}],
         })
 
+        # ----------------------------------------------------------------
+        # (1) Messages API  — Claude models only
+        # ----------------------------------------------------------------
+        if is_claude:
+            try:
+                # Convert to the Anthropic Messages format:
+                # each content block is a plain string, not a list of dicts.
+                messages_api_body = {
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "system": _SYSTEM_PROMPT,
+                    "messages": [
+                        {
+                            "role": msg["role"],
+                            "content": msg["content"][0]["text"],
+                        }
+                        for msg in conversation
+                    ],
+                    "max_tokens": 1024,
+                }
+                raw_response = client.invoke_model(
+                    modelId=model_id,
+                    contentType="application/json",
+                    accept="application/json",
+                    body=json.dumps(messages_api_body),
+                )
+                body_bytes = raw_response["body"].read()
+                response_data = json.loads(body_bytes)
+                raw_text: str = response_data["content"][0]["text"]
+                result = self._parse_spec(raw_text)
+                logger.info("LLMQueryPlanner: Claude Messages API succeeded.")
+                return result
+            except Exception as exc:
+                logger.warning(
+                    "LLMQueryPlanner: Messages API failed (%s), trying Converse API.", exc
+                )
+
+        # ----------------------------------------------------------------
+        # (2) Converse API  — universal fallback for all models
+        # ----------------------------------------------------------------
         try:
-            client = boto3.client("bedrock-runtime", region_name=self._settings.aws_region)
             response = client.converse(
-                modelId=self._settings.bedrock_model_id,
+                modelId=model_id,
                 system=[{"text": _SYSTEM_PROMPT}],
                 messages=conversation,
             )
-            raw_text: str = response["output"]["message"]["content"][0]["text"]
-            # strip possible markdown fences
-            raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip(), flags=re.I)
-            raw_text = re.sub(r"\n?```$", "", raw_text.strip())
-            data = json.loads(raw_text)
-            url_filters = AmazonURLFilters(**data.pop("amazon_url_filters", {}))
-            return SearchSpec(amazon_url_filters=url_filters, **data)
+            raw_text = response["output"]["message"]["content"][0]["text"]
+            result = self._parse_spec(raw_text)
+            logger.info("LLMQueryPlanner: Converse API succeeded.")
+            return result
         except Exception as exc:
-            logger.warning("LLMQueryPlanner Bedrock error: %s", exc)
-            return None
+            logger.warning(
+                "LLMQueryPlanner: Converse API failed (%s), falling back to regex.", exc
+            )
+
+        # ----------------------------------------------------------------
+        # (3) All Bedrock paths failed — signal regex fallback
+        # ----------------------------------------------------------------
+        return None
+
+    # ------------------------------------------------------------------
+    # Shared JSON → SearchSpec parser
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_spec(raw_text: str) -> SearchSpec:
+        """Strip markdown fences and parse the LLM JSON into a SearchSpec."""
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text.strip(), flags=re.I)
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+        data = json.loads(raw_text)
+        url_filters = AmazonURLFilters(**data.pop("amazon_url_filters", {}))
+        return SearchSpec(amazon_url_filters=url_filters, **data)
 
     # ------------------------------------------------------------------
     # Regex fallback (mirrors old _intent_agent logic)
