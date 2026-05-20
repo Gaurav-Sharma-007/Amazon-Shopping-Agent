@@ -78,28 +78,26 @@ class DynamoDBProductRepository(ProductRepository):
     async def save_products(
         self, session_id: str, products: Iterable[RankedProduct]
     ) -> int:
-        # Deduplicate by (pk, sk) — BatchWriteItem raises ValidationException
-        # if the same key appears more than once in a single batch.
-        # This can happen when the scraper returns duplicate ASINs or when
-        # sample products (sample-1/2/3) are used across multiple calls.
-        unique: dict[tuple[str, str], dict] = {}
+        # Use individual put_item() instead of batch_writer() to avoid
+        # 'Provided list of item keys contains duplicates' when DynamoDB's
+        # internal retry mechanism resubmits UnprocessedItems alongside new ones.
+        # put_item is idempotent and has no batch-level key uniqueness restriction.
+        seen: set[str] = set()
+        saved = 0
         for product in products:
-            pk = f"SESSION#{session_id}"
-            sk = f"PRODUCT#{product.product_id}"
-            # DynamoDB high-level resource API does not accept Python float.
-            # parse_float=Decimal converts every JSON number to Decimal.
-            unique[(pk, sk)] = {
-                "pk": pk,
-                "sk": sk,
+            if product.product_id in seen:
+                continue  # skip genuine duplicates in the ranked list
+            seen.add(product.product_id)
+            item = {
+                "pk": f"SESSION#{session_id}",
+                "sk": f"PRODUCT#{product.product_id}",
                 "session_id": session_id,
+                # parse_float=Decimal: DynamoDB rejects Python float — must be Decimal.
                 **json.loads(product.model_dump_json(), parse_float=Decimal),
             }
-
-        with self.table.batch_writer() as batch:
-            for item in unique.values():
-                batch.put_item(Item=item)
-
-        return len(unique)
+            self.table.put_item(Item=item)
+            saved += 1
+        return saved
 
 
 def build_product_repository() -> ProductRepository:

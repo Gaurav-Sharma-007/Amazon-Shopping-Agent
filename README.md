@@ -151,93 +151,87 @@ You can point each slot at any model available in your AWS account.
 
 ### Model ID format
 
-```
-<scope>.<provider>.<model-name>:<version>
-```
+Model IDs come in two forms:
 
-- `us.`     — US cross-region inference profile (routes via `us-east-1` / `us-west-2`)
-- `global.` — Global cross-region inference profile (requires additional AWS approval form)
+| Form | Example | When to use |
+|---|---|---|
+| **Bare** (no prefix) | `anthropic.claude-3-haiku-20240307-v1:0` | Use from your home region directly |
+| **Regional prefix** | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Cross-region inference, US regions only |
+| **Global prefix** | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Requires additional AWS approval form |
 
----
+> **`ap-south-1` (Mumbai) users:** use bare model IDs — no `us.` or `global.` prefix.
+> The `us.*` and `global.*` prefixed IDs are invalid in AP regions and will cause
+> `ValidationException: The provided model identifier is invalid`.
 
-### Available models on Amazon Bedrock
-
-#### Anthropic Claude (recommended)
-
-| Model | ID |
-|---|---|
-| Claude Haiku 4.5 (fast, cheap) | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
-| Claude Sonnet 4.5 (balanced) | `us.anthropic.claude-sonnet-4-5-20251001-v1:0` |
-| Claude Opus 4 (most capable) | `us.anthropic.claude-opus-4-20250514-v1:0` |
-
-> To use Claude models, go to **AWS Console → Bedrock → Model Access** in `us-east-1`
-> and request access to the Anthropic model family.
-
-**Example — use Sonnet for planning/ranking, Haiku for responses:**
-
-```ini
-[aws]
-query_planner_model_id = us.anthropic.claude-sonnet-4-5-20251001-v1:0
-bedrock_model_id       = us.anthropic.claude-haiku-4-5-20251001-v1:0
+To see every model available to your account in a region:
+```bash
+aws bedrock list-foundation-models --region ap-south-1 \
+    --query 'modelSummaries[?contains(inferenceTypesSupported, `ON_DEMAND`)].modelId' \
+    --output table
 ```
 
 ---
 
-#### Mistral AI (on Bedrock)
+### Models confirmed available in `ap-south-1` (Mumbai)
 
-Mistral models are available natively on Amazon Bedrock. They follow a similar
-`converse` API so they work as drop-in replacements.
+These model IDs were verified live against the Bedrock API.
+
+#### Anthropic Claude
 
 | Model | ID |
 |---|---|
-| Mistral Large 2 | `mistral.mistral-large-2402-v1:0` |
-| Mistral Small | `mistral.mistral-small-2402-v1:0` |
-| Mixtral 8x7B | `mistral.mixtral-8x7b-instruct-v0:1` |
+| Claude 3 Haiku (fast, cheap) ✅ | `anthropic.claude-3-haiku-20240307-v1:0` |
+| Claude 3 Sonnet ✅ | `anthropic.claude-3-sonnet-20240229-v1:0` |
 
-**Example — Mistral Large for planning, Haiku for responses:**
+**Example (current `config.ini` setup):**
 
 ```ini
 [aws]
 query_planner_model_id = mistral.mistral-large-2402-v1:0
-bedrock_model_id       = us.anthropic.claude-haiku-4-5-20251001-v1:0
-```
-
-> Enable Mistral models at **AWS Console → Bedrock → Model Access** in your region.
-> Mistral is not available in all regions — `us-east-1` and `eu-west-1` are safest.
-
----
-
-#### Amazon Titan / Nova (no approval needed)
-
-Amazon's own models are enabled by default on every Bedrock account.
-
-| Model | ID |
-|---|---|
-| Nova Micro (ultra-fast) | `us.amazon.nova-micro-v1:0` |
-| Nova Lite | `us.amazon.nova-lite-v1:0` |
-| Nova Pro | `us.amazon.nova-pro-v1:0` |
-
-**Example — Nova for everything (zero approval required):**
-
-```ini
-[aws]
-query_planner_model_id = us.amazon.nova-lite-v1:0
-bedrock_model_id       = us.amazon.nova-micro-v1:0
+bedrock_model_id       = anthropic.claude-3-haiku-20240307-v1:0
 ```
 
 ---
 
-#### Meta Llama (on Bedrock)
+#### Mistral AI ✅ (confirmed in `ap-south-1`)
 
 | Model | ID |
 |---|---|
-| Llama 3.3 70B Instruct | `us.meta.llama3-3-70b-instruct-v1:0` |
-| Llama 3.1 8B Instruct | `us.meta.llama3-1-8b-instruct-v1:0` |
+| Mistral Large 2 ✅ | `mistral.mistral-large-2402-v1:0` |
+| Mistral Large 3 ✅ | `mistral.mistral-large-3-675b-instruct` |
+| Mixtral 8x7B ✅ | `mistral.mixtral-8x7b-instruct-v0:1` |
+| Ministral 8B ✅ | `mistral.ministral-3-8b-instruct` |
+| Ministral 3B ✅ | `mistral.ministral-3-3b-instruct` |
+
+**Example — Mistral Large for planning, Claude Haiku for responses:**
 
 ```ini
 [aws]
-query_planner_model_id = us.meta.llama3-3-70b-instruct-v1:0
-bedrock_model_id       = us.meta.llama3-1-8b-instruct-v1:0
+query_planner_model_id = mistral.mistral-large-2402-v1:0
+bedrock_model_id       = anthropic.claude-3-haiku-20240307-v1:0
+```
+
+---
+
+#### Amazon Nova / Titan
+
+> Amazon Nova models (`us.amazon.nova-*`) are **not available** in `ap-south-1` directly.
+> They require the `us.` cross-region routing which is US-only.
+> Use Titan embed models for embeddings — they are available in `ap-south-1`.
+
+---
+
+#### Meta Llama ✅ (confirmed in `ap-south-1`)
+
+| Model | ID |
+|---|---|
+| Llama 3 70B Instruct ✅ | `meta.llama3-70b-instruct-v1:0` |
+| Llama 3 8B Instruct ✅ | `meta.llama3-8b-instruct-v1:0` |
+
+```ini
+[aws]
+query_planner_model_id = meta.llama3-70b-instruct-v1:0
+bedrock_model_id       = meta.llama3-8b-instruct-v1:0
 ```
 
 ---
