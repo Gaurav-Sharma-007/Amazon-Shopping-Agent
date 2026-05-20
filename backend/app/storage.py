@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 """
 Storage Layer
 =============
@@ -9,6 +11,7 @@ Provides two concerns:
 2. ``QueryCache`` — DynamoDB-backed cache for scraped results, keyed on SearchSpec hash.
    Falls back to a local JSON file when DynamoDB is unavailable.
 """
+
 
 import json
 import time
@@ -75,18 +78,28 @@ class DynamoDBProductRepository(ProductRepository):
     async def save_products(
         self, session_id: str, products: Iterable[RankedProduct]
     ) -> int:
-        saved = 0
+        # Deduplicate by (pk, sk) — BatchWriteItem raises ValidationException
+        # if the same key appears more than once in a single batch.
+        # This can happen when the scraper returns duplicate ASINs or when
+        # sample products (sample-1/2/3) are used across multiple calls.
+        unique: dict[tuple[str, str], dict] = {}
+        for product in products:
+            pk = f"SESSION#{session_id}"
+            sk = f"PRODUCT#{product.product_id}"
+            # DynamoDB high-level resource API does not accept Python float.
+            # parse_float=Decimal converts every JSON number to Decimal.
+            unique[(pk, sk)] = {
+                "pk": pk,
+                "sk": sk,
+                "session_id": session_id,
+                **json.loads(product.model_dump_json(), parse_float=Decimal),
+            }
+
         with self.table.batch_writer() as batch:
-            for product in products:
-                item = {
-                    "pk": f"SESSION#{session_id}",
-                    "sk": f"PRODUCT#{product.product_id}",
-                    "session_id": session_id,
-                    **json.loads(product.model_dump_json()),
-                }
+            for item in unique.values():
                 batch.put_item(Item=item)
-                saved += 1
-        return saved
+
+        return len(unique)
 
 
 def build_product_repository() -> ProductRepository:
