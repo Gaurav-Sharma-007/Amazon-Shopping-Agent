@@ -1,16 +1,37 @@
 from __future__ import annotations
 
-import re
+"""
+Product Recommendation Graph — v2
+==================================
+LangGraph pipeline with six nodes:
+
+  orchestrator        — loads session memory, routes message
+  intent_agent        — LLM Query Planner → SearchSpec  (+ regex fallback)
+  scraping_agent      — Amazon SERP scraper with native URL filters + TTL cache
+  relevance_filter    — LLM scores each product 0-10; drops irrelevant ones
+  ranking_agent       — LLM ranks remaining products with reasoning
+  recommendation_llm  — Bedrock generates final human-readable response
+  database_agent      — persists RankedProducts to DynamoDB / local JSON
+
+Key improvements over v1:
+  - Intent is parsed by Bedrock Claude → SearchSpec (not regex).
+  - All major filters (price, rating, Prime, brand, sort) are baked into the
+    Amazon search URL BEFORE Playwright loads any page.
+  - A dedicated Bedrock call scores relevance of each card and drops junk.
+  - A second Bedrock call ranks the remaining products with explicit reasoning.
+  - Result cache (DynamoDB or in-process) avoids redundant Playwright calls.
+"""
+
+import logging
 
 from langgraph.graph import END, StateGraph
 
 from .llm import RecommendationLLM
+from .llm_query_planner import LLMQueryPlanner
+from .llm_relevance_filter import LLMRelevanceFilter
+from .llm_ranker import LLMRanker
+from .marketplaces import marketplace_label
 from .memory import SessionMemory
-from .marketplaces import (
-    find_marketplace_in_text,
-    marketplace_label,
-    strip_marketplace_terms,
-)
 from .models import (
     AgentState,
     ChatMessage,
@@ -20,58 +41,13 @@ from .models import (
     ProductFilters,
     RankedProduct,
     Recommendation,
+    ScoredProduct,
+    SearchSpec,
 )
-from .ranking import rank_products
 from .scraper import AmazonCatalogScraper
-from .storage import ProductRepository, build_product_repository
+from .storage import ProductRepository, QueryCache, build_product_repository, build_query_cache
 
-
-PRICE_UNDER_RE = re.compile(
-    r"(?:under|below|less than|max|budget)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
-    re.I,
-)
-PRICE_OVER_RE = re.compile(
-    r"(?:over|above|at least|min(?:imum)?)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)(?![\d.])(?!\s*(?:stars?|reviews?|ratings?))",
-    re.I,
-)
-PRICE_RANGE_RE = re.compile(
-    r"(?:price\s*)?(?:range\s*)?(?:of|between|from)?\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)\s*(?:to|-|and)\s*(?:[$₹]|rs\.?|inr)?\s*(\d[\d,]*(?:\.\d+)?)",
-    re.I,
-)
-RATING_RE = re.compile(r"(\d(?:\.\d)?)\s*(?:star|stars|\+)", re.I)
-RATING_KEYWORD_RE = re.compile(
-    r"(?:min(?:imum)?\s*)?(?:rating|rated)\s*(?:of|at least|above|over)?\s*(\d(?:\.\d)?)",
-    re.I,
-)
-REVIEWS_RE = re.compile(
-    r"(?:(?:at least|min(?:imum)?|over|above)\s*)?(\d[\d,]*)\+?\s*(?:reviews?|ratings?)",
-    re.I,
-)
-COLOR_WORDS = {
-    "black",
-    "white",
-    "red",
-    "blue",
-    "green",
-    "yellow",
-    "pink",
-    "purple",
-    "violet",
-    "orange",
-    "brown",
-    "grey",
-    "gray",
-    "silver",
-    "gold",
-    "golden",
-    "beige",
-    "cream",
-    "transparent",
-}
-REFINEMENT_RE = re.compile(
-    r"\b(change|switch|make|same|instead|only|just|update|modify|replace)\b",
-    re.I,
-)
+logger = logging.getLogger(__name__)
 
 
 class ProductRecommendationGraph:
@@ -80,13 +56,25 @@ class ProductRecommendationGraph:
         memory: SessionMemory | None = None,
         scraper: AmazonCatalogScraper | None = None,
         repository: ProductRepository | None = None,
+        query_cache: QueryCache | None = None,
         llm: RecommendationLLM | None = None,
+        planner: LLMQueryPlanner | None = None,
+        relevance_filter: LLMRelevanceFilter | None = None,
+        ranker: LLMRanker | None = None,
     ) -> None:
         self.memory = memory or SessionMemory()
         self.scraper = scraper or AmazonCatalogScraper()
         self.repository = repository or build_product_repository()
+        self.query_cache = query_cache or build_query_cache()
         self.llm = llm or RecommendationLLM()
+        self.planner = planner or LLMQueryPlanner()
+        self.relevance_filter = relevance_filter or LLMRelevanceFilter()
+        self.ranker = ranker or LLMRanker()
         self.graph = self._build_graph().compile()
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
     async def run(self, request: ChatRequest) -> ChatResponse:
         session_id = request.session_id or self.memory.create_session_id()
@@ -94,6 +82,7 @@ class ProductRecommendationGraph:
         messages = previous.get("messages", [])
         filters = ProductFilters(**previous.get("filters", {}))
 
+        # Merge any explicit filters from the request
         incoming = request.filters.model_dump(exclude_unset=True)
         if incoming:
             filters = filters.model_copy(update=incoming)
@@ -111,15 +100,14 @@ class ProductRecommendationGraph:
         recommendation = Recommendation(**result["recommendation"])
 
         final_messages = [
-            ChatMessage(**message) if isinstance(message, dict) else message
-            for message in result["messages"]
+            ChatMessage(**msg) if isinstance(msg, dict) else msg
+            for msg in result["messages"]
         ]
-        final_messages.append(ChatMessage(role="assistant", content=recommendation.summary))
+        final_messages.append(
+            ChatMessage(role="assistant", content=recommendation.summary)
+        )
         self.memory.save(
-            session_id,
-            final_messages,
-            final_filters,
-            recommendation.model_dump(),
+            session_id, final_messages, final_filters, recommendation.model_dump()
         )
 
         return ChatResponse(
@@ -131,11 +119,16 @@ class ProductRecommendationGraph:
             trace=result.get("trace", []),
         )
 
+    # ------------------------------------------------------------------
+    # Graph construction
+    # ------------------------------------------------------------------
+
     def _build_graph(self) -> StateGraph:
         graph = StateGraph(AgentState)
         graph.add_node("orchestrator", self._orchestrator)
         graph.add_node("intent_agent", self._intent_agent)
         graph.add_node("scraping_agent", self._scraping_agent)
+        graph.add_node("relevance_filter", self._relevance_filter_node)
         graph.add_node("ranking_agent", self._ranking_agent)
         graph.add_node("database_agent", self._database_agent)
         graph.add_node("recommendation_llm", self._recommendation_llm)
@@ -143,209 +136,168 @@ class ProductRecommendationGraph:
         graph.set_entry_point("orchestrator")
         graph.add_edge("orchestrator", "intent_agent")
         graph.add_edge("intent_agent", "scraping_agent")
-        graph.add_edge("scraping_agent", "ranking_agent")
+        graph.add_edge("scraping_agent", "relevance_filter")
+        graph.add_edge("relevance_filter", "ranking_agent")
         graph.add_edge("ranking_agent", "database_agent")
         graph.add_edge("database_agent", "recommendation_llm")
         graph.add_edge("recommendation_llm", END)
         return graph
 
+    # ------------------------------------------------------------------
+    # Node: Orchestrator
+    # ------------------------------------------------------------------
+
     async def _orchestrator(self, state: AgentState) -> AgentState:
         trace = state.get("trace", [])
-        trace.append("Orchestrator loaded previous session memory and routed to intent agent.")
+        trace.append("Orchestrator: loaded session memory and routed to intent agent.")
         messages = state.get("messages", [])
         messages.append({"role": "user", "content": state["user_message"]})
         return {**state, "messages": messages, "trace": trace}
 
+    # ------------------------------------------------------------------
+    # Node: Intent Agent  (LLM Query Planner → SearchSpec)
+    # ------------------------------------------------------------------
+
     async def _intent_agent(self, state: AgentState) -> AgentState:
         filters = ProductFilters(**state["filters"])
-        message = state["user_message"]
-        lower = message.lower()
-
-        range_match = PRICE_RANGE_RE.search(message)
-        max_match = PRICE_UNDER_RE.search(message)
-        min_match = PRICE_OVER_RE.search(message)
-        rating_match = RATING_RE.search(message) or RATING_KEYWORD_RE.search(message)
-        reviews_match = REVIEWS_RE.search(message)
-        marketplace = find_marketplace_in_text(message)
-        if marketplace:
-            filters.marketplace = marketplace
-        if range_match:
-            low = float(range_match.group(1).replace(",", ""))
-            high = float(range_match.group(2).replace(",", ""))
-            filters.min_price = min(low, high)
-            filters.max_price = max(low, high)
-        elif max_match:
-            filters.max_price = float(max_match.group(1).replace(",", ""))
-        if min_match and not range_match:
-            filters.min_price = float(min_match.group(1).replace(",", ""))
-        if rating_match:
-            filters.min_rating = min(5, float(rating_match.group(1)))
-        if reviews_match:
-            filters.min_reviews = int(reviews_match.group(1).replace(",", ""))
-        if "prime" in lower:
-            filters.prime_only = True
-        if any(word in lower for word in ["cheap", "budget", "affordable"]):
-            filters.sort_goal = "budget"
-        if any(word in lower for word in ["value", "best for money", "worth"]):
-            filters.sort_goal = "value"
-
-        colors = _extract_colors(message)
-        if colors:
-            filters.must_have = [
-                item for item in filters.must_have if item.lower() not in COLOR_WORDS
-            ]
-            for color in colors:
-                if color not in filters.must_have:
-                    filters.must_have.append(color)
-
-        extracted_query = _extract_query(message)
-        if extracted_query and not _is_refinement_message(message, extracted_query, filters.query):
-            filters.query = extracted_query
-
-        must_have = _extract_after_keywords(
-            lower, ["with ", "must have ", "needs to have ", "that has "]
+        spec: SearchSpec = await self.planner.plan(
+            user_message=state["user_message"],
+            session_messages=state.get("messages", []),
+            current_filters=filters,
         )
-        for term in must_have:
-            if term not in filters.must_have and len(term) <= 40:
-                filters.must_have.append(term)
 
-        for brand in _extract_brands(message):
-            if brand.lower() not in {item.lower() for item in filters.brands}:
-                filters.brands.append(brand)
-
-        for term in _extract_after_keywords(lower, ["avoid ", "without ", "exclude "]):
-            if term not in filters.avoid and len(term) <= 40:
-                filters.avoid.append(term)
+        # Sync ProductFilters back from SearchSpec so session memory stays
+        # compatible and the API surface is unchanged.
+        url_f = spec.amazon_url_filters
+        if url_f.p_36:
+            parts = url_f.p_36.split("-")
+            if len(parts) == 2:
+                filters.min_price = int(parts[0]) / 100
+                filters.max_price = int(parts[1]) / 100
+        if url_f.p_72:
+            # Store the rating indirectly — the node ID implies ≥4★ or ≥3★
+            if url_f.p_72 in {"2421889011", "328520031", "669342031", "1292115031"}:
+                filters.min_rating = 4.0
+            else:
+                filters.min_rating = 3.0
+        if url_f.p_85:
+            filters.prime_only = True
+        filters.brands = spec.brands
+        filters.must_have = spec.must_have_keywords
+        filters.avoid = spec.avoid_keywords
+        filters.sort_goal = spec.sort_goal
+        filters.query = spec.search_term
+        filters.marketplace = spec.marketplace
 
         trace = state.get("trace", [])
         trace.append(
-            "Intent agent converted natural language into query, filters, "
-            f"preferences, and marketplace: {marketplace_label(filters.marketplace)}."
+            f"Intent agent (LLM Query Planner): search_term='{spec.search_term}', "
+            f"marketplace={marketplace_label(spec.marketplace)}, "
+            f"url_filters={url_f.model_dump(exclude_none=True)}."
         )
-        return {**state, "filters": filters.model_dump(), "search_query": filters.query, "trace": trace}
-
-    async def _scraping_agent(self, state: AgentState) -> AgentState:
-        filters = ProductFilters(**state["filters"])
-        products = await self.scraper.search(filters)
-        trace = state.get("trace", [])
-        trace.append(f"Scraping agent collected {len(products)} catalog candidates.")
-        return {**state, "products": [product.model_dump() for product in products], "trace": trace}
-
-    async def _ranking_agent(self, state: AgentState) -> AgentState:
-        filters = ProductFilters(**state["filters"])
-        products = [Product(**product) for product in state.get("products", [])]
-        ranked = rank_products(products, filters)
-        trace = state.get("trace", [])
-        trace.append("Ranking agent scored candidates using quality, price, delivery, and preference fit.")
         return {
             **state,
-            "ranked_products": [product.model_dump() for product in ranked],
+            "filters": filters.model_dump(),
+            "scrape_plan": spec.model_dump(),
+            "search_query": spec.search_term,
             "trace": trace,
         }
 
+    # ------------------------------------------------------------------
+    # Node: Scraping Agent
+    # ------------------------------------------------------------------
+
+    async def _scraping_agent(self, state: AgentState) -> AgentState:
+        spec = SearchSpec(**state["scrape_plan"])
+        trace = state.get("trace", [])
+        cache_hit = False
+
+        # Check persistent query cache first
+        from .scraper import _cache_key
+        from .config import get_settings
+        key = _cache_key(spec)
+        cached = self.query_cache.get(key)
+        if cached:
+            products = cached
+            cache_hit = True
+            trace.append(
+                f"Scraping agent: cache hit ({len(products)} products, key={key[:8]}…)."
+            )
+        else:
+            products = await self.scraper.search(spec)
+            settings = get_settings()
+            self.query_cache.put(key, products, settings.query_cache_ttl_seconds)
+            trace.append(
+                f"Scraping agent: scraped {len(products)} products from Amazon "
+                f"with native URL filters."
+            )
+
+        return {
+            **state,
+            "products": [p.model_dump() for p in products],
+            "cache_hit": cache_hit,
+            "trace": trace,
+        }
+
+    # ------------------------------------------------------------------
+    # Node: Relevance Filter  (LLM scores each product 0-10)
+    # ------------------------------------------------------------------
+
+    async def _relevance_filter_node(self, state: AgentState) -> AgentState:
+        spec = SearchSpec(**state["scrape_plan"])
+        products = [Product(**p) for p in state.get("products", [])]
+        scored = await self.relevance_filter.filter(products, spec)
+        trace = state.get("trace", [])
+        dropped = len(products) - len(scored)
+        trace.append(
+            f"Relevance filter: {len(scored)} products kept, "
+            f"{dropped} dropped as irrelevant."
+        )
+        return {
+            **state,
+            "scored_products": [p.model_dump() for p in scored],
+            "trace": trace,
+        }
+
+    # ------------------------------------------------------------------
+    # Node: Ranking Agent  (LLM ranks with value/intent/quality axes)
+    # ------------------------------------------------------------------
+
+    async def _ranking_agent(self, state: AgentState) -> AgentState:
+        spec = SearchSpec(**state["scrape_plan"])
+        filters = ProductFilters(**state["filters"])
+        scored = [ScoredProduct(**p) for p in state.get("scored_products", [])]
+        ranked = await self.ranker.rank(scored, spec, filters)
+        trace = state.get("trace", [])
+        trace.append(
+            f"Ranking agent (LLM): ranked {len(ranked)} products by "
+            "value_for_money, user_intent_fit, quality_signals."
+        )
+        return {
+            **state,
+            "ranked_products": [p.model_dump() for p in ranked],
+            "trace": trace,
+        }
+
+    # ------------------------------------------------------------------
+    # Node: Database Agent
+    # ------------------------------------------------------------------
+
     async def _database_agent(self, state: AgentState) -> AgentState:
-        ranked = [RankedProduct(**product) for product in state.get("ranked_products", [])]
+        ranked = [RankedProduct(**p) for p in state.get("ranked_products", [])]
         saved = await self.repository.save_products(state["session_id"], ranked)
         trace = state.get("trace", [])
-        trace.append(f"Database agent saved {saved} ranked products for the session.")
+        trace.append(f"Database agent: saved {saved} ranked products to persistent store.")
         return {**state, "products_saved": saved, "trace": trace}
+
+    # ------------------------------------------------------------------
+    # Node: Recommendation LLM  (response builder)
+    # ------------------------------------------------------------------
 
     async def _recommendation_llm(self, state: AgentState) -> AgentState:
         filters = ProductFilters(**state["filters"])
-        ranked = [RankedProduct(**product) for product in state.get("ranked_products", [])]
+        ranked = [RankedProduct(**p) for p in state.get("ranked_products", [])]
         recommendation = await self.llm.explain(filters, ranked)
         trace = state.get("trace", [])
         trace.append(self.llm.last_status)
         return {**state, "recommendation": recommendation.model_dump(), "trace": trace}
-
-
-def _extract_query(message: str) -> str:
-    cleaned = strip_marketplace_terms(message)
-    cleaned = PRICE_RANGE_RE.sub("", cleaned)
-    cleaned = PRICE_UNDER_RE.sub("", cleaned)
-    cleaned = PRICE_OVER_RE.sub("", cleaned)
-    cleaned = re.sub(r"\b(?:in|under|un)\s+the\s+price\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\bprice\s+range\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\bun\s+the\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b\d(?:\.\d)?\s*(star|stars|\+)\b", "", cleaned, flags=re.I)
-    cleaned = RATING_KEYWORD_RE.sub("", cleaned)
-    cleaned = REVIEWS_RE.sub("", cleaned)
-    cleaned = re.sub(r"\bbrands?\s*(?:are|include|:|=)?\s*[^.;,]+(?:[,;]\s*[^.;,]+)*", "", cleaned, flags=re.I)
-    cleaned = re.sub(
-        r"\bfrom\s+[a-z0-9&\-\s,]+?(?=\s+\b(?:with|under|below|less than|over|above|at least|avoid|without|exclude|rating|reviews?|prime)\b|$)",
-        "",
-        cleaned,
-        flags=re.I,
-    )
-    cleaned = re.sub(r"\b(i want|i need|find me|recommend|show me|looking for|best|amazon|prime)\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(change|switch|make|update|modify|replace)\s+(the\s+)?colou?r\s+(to\s+)?\w+\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(colou?r)\s+(to\s+)?\w+\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(colou?red|color)\b", "", cleaned, flags=re.I)
-    for color in COLOR_WORDS:
-        cleaned = re.sub(rf"\b{re.escape(color)}\b", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\b(with|must have|avoid|without|exclude)\b.*", "", cleaned, flags=re.I)
-    cleaned = " ".join(cleaned.split())
-    return cleaned.strip(" ,.-")[:120]
-
-
-def _extract_after_keywords(message: str, keywords: list[str]) -> list[str]:
-    results: list[str] = []
-    for keyword in keywords:
-        if keyword in message:
-            tail = message.split(keyword, 1)[1]
-            tail = re.split(
-                r"\b(?:under|below|less than|over|above|at least|for|and avoid|minimum|rating|reviews?|brands?)\b",
-                tail,
-            )[0]
-            for part in re.split(r",| and ", tail):
-                normalized = part.strip(" .")
-                if normalized and normalized not in {"prime", "amazon prime"} and len(normalized.split()) <= 4:
-                    results.append(normalized)
-    return results[:5]
-
-
-def _extract_brands(message: str) -> list[str]:
-    match = re.search(
-        r"\bbrands?\s*(?:are|include|:|=)?\s*([a-z0-9][a-z0-9&\-\s,]+)",
-        message,
-        re.I,
-    )
-    if not match:
-        match = re.search(
-            r"\bfrom\s+([a-z0-9][a-z0-9&\-\s,]+)",
-            message,
-            re.I,
-        )
-    if not match:
-        return []
-
-    tail = re.split(
-        r"\b(?:under|below|less than|over|above|at least|with|must have|avoid|without|exclude|rating|reviews?|prime)\b",
-        match.group(1),
-        maxsplit=1,
-        flags=re.I,
-    )[0]
-    brands: list[str] = []
-    for part in re.split(r",|/|\bor\b|\band\b", tail, flags=re.I):
-        brand = " ".join(part.strip(" .:-").split())
-        if brand and len(brand.split()) <= 3:
-            brands.append(brand.upper() if brand.isupper() else brand.title())
-    return brands[:5]
-
-
-def _extract_colors(message: str) -> list[str]:
-    lowered = message.lower()
-    colors = [color for color in COLOR_WORDS if re.search(rf"\b{re.escape(color)}\b", lowered)]
-    return sorted(colors, key=lambda color: lowered.index(color))[:3]
-
-
-def _is_refinement_message(message: str, extracted_query: str, current_query: str) -> bool:
-    if not current_query:
-        return False
-    lowered_query = extracted_query.lower()
-    if REFINEMENT_RE.search(message):
-        return True
-    if lowered_query in COLOR_WORDS:
-        return True
-    non_product_terms = COLOR_WORDS | {"color", "colour", "colored", "coloured"}
-    return bool(lowered_query) and all(token in non_product_terms for token in lowered_query.split())

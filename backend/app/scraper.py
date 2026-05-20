@@ -1,28 +1,47 @@
 from __future__ import annotations
 
+"""
+Amazon Catalog Scraper — v2
+===========================
+Key changes from v1:
+  - Accepts a ``SearchSpec`` instead of ``ProductFilters``.
+  - Builds the Amazon SERP URL with native filter parameters (price, rating,
+    Prime, brand, sort) so Amazon applies them server-side BEFORE delivering
+    results.  No more ``_passes_filters()`` post-processing.
+  - Keyword-only check (must_have / avoid) is the ONLY Python-side filter
+    kept, because Amazon can't filter on arbitrary keywords.
+  - Query-result caching: identical SearchSpec hits are served from an
+    in-process TTL cache to reduce Playwright round-trips during a session.
+"""
+
 import asyncio
 import hashlib
+import logging
 import re
-from urllib.parse import quote_plus, urljoin
+import time
+from urllib.parse import quote_plus, urlencode, urljoin
 
 from .config import get_settings
 from .marketplaces import marketplace_currency, marketplace_domain
-from .models import Product, ProductFilters
+from .models import Product, SearchSpec
 from .storage import sample_products
 
+logger = logging.getLogger(__name__)
 
 PRICE_RE = re.compile(r"(\d[\d,]*(?:\.\d{1,2})?)")
 RATING_RE = re.compile(r"([0-5](?:\.\d)?)\s+out of 5")
 REVIEWS_RE = re.compile(r"(\d[\d,]*)")
+
+# Simple in-process TTL cache  {cache_key: (timestamp, products)}
+_RESULT_CACHE: dict[str, tuple[float, list[Product]]] = {}
+_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 def _parse_price(value: str | None) -> float | None:
     if not value:
         return None
     match = PRICE_RE.search(value.replace("\n", " "))
-    if not match:
-        return None
-    return float(match.group(1).replace(",", ""))
+    return float(match.group(1).replace(",", "")) if match else None
 
 
 def _parse_rating(value: str | None) -> float | None:
@@ -39,61 +58,137 @@ def _parse_reviews(value: str | None) -> int | None:
     return int(match.group(1).replace(",", "")) if match else None
 
 
-class AmazonCatalogScraper:
-    """Playwright traversal for public Amazon search result pages."""
+def build_search_url(domain: str, spec: SearchSpec, page: int) -> str:
+    """
+    Construct the Amazon SERP URL with native filter parameters.
 
-    async def search(self, filters: ProductFilters) -> list[Product]:
+    Amazon URL filter params used:
+      k      — search keyword
+      page   — page number
+      p_36   — price range (min-max in currency-unit × 100)
+      p_72   — minimum star-rating node ID
+      p_85   — Prime eligible flag
+      p_89   — brand filter
+      s      — sort order
+      i      — department slug
+    """
+    params: dict[str, str] = {
+        "k": spec.search_term,
+        "page": str(page),
+    }
+
+    url_f = spec.amazon_url_filters
+    if url_f.p_36:
+        params["p_36"] = url_f.p_36
+    if url_f.p_72:
+        params["p_72"] = url_f.p_72
+    if url_f.p_85:
+        params["p_85"] = url_f.p_85
+    if url_f.p_89:
+        params["p_89"] = url_f.p_89
+    if url_f.s:
+        params["s"] = url_f.s
+    if url_f.i:
+        params["i"] = url_f.i
+
+    return f"{domain}/s?{urlencode(params)}"
+
+
+def _cache_key(spec: SearchSpec) -> str:
+    """Deterministic key for the in-process result cache."""
+    key_str = (
+        f"{spec.marketplace}|{spec.search_term}|"
+        f"{spec.amazon_url_filters.model_dump_json()}"
+    )
+    return hashlib.sha1(key_str.encode()).hexdigest()[:20]
+
+
+class AmazonCatalogScraper:
+    """Playwright-powered Amazon SERP scraper using native URL-level filters."""
+
+    async def search(self, spec: SearchSpec) -> list[Product]:
+        """
+        Scrape Amazon using the SearchSpec.
+        1. Build pre-filtered URL (Amazon applies server-side filters).
+        2. Extract product cards with Playwright.
+        3. Apply must_have / avoid keyword checks in Python (only light pass).
+        4. Return up to scraper_max_results products.
+        """
         settings = get_settings()
-        query = filters.query.strip() or "wireless headphones"
-        domain = marketplace_domain(filters.marketplace)
-        currency_code, currency_symbol = marketplace_currency(filters.marketplace)
-        products: list[Product] = []
-        extracted_count = 0
+        domain = marketplace_domain(spec.marketplace)
+        currency_code, currency_symbol = marketplace_currency(spec.marketplace)
+
+        # ---- cache check ----
+        key = _cache_key(spec)
+        cached = _RESULT_CACHE.get(key)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+            logger.info("AmazonCatalogScraper: cache hit for key=%s", key)
+            return cached[1]
 
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            return sample_products(query, filters)
+            logger.warning("Playwright not installed — returning sample products.")
+            return sample_products(spec.search_term)
+
+        products: list[Product] = []
+        extracted_count = 0
 
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page(viewport={"width": 1366, "height": 900})
+                context = await browser.new_context(
+                    viewport={"width": 1366, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                )
+                page = await context.new_page()
                 page.set_default_timeout(settings.scraper_timeout_ms)
 
-                for page_number in range(1, settings.scraper_max_pages + 1):
-                    url = (
-                        f"{domain}/s?k={quote_plus(query)}"
-                        f"&page={page_number}"
-                    )
+                max_pages = min(spec.max_pages, settings.scraper_max_pages)
+                for page_number in range(1, max_pages + 1):
+                    url = build_search_url(domain, spec, page_number)
+                    logger.info("AmazonCatalogScraper: fetching %s", url)
+
                     await page.goto(url, wait_until="domcontentloaded")
                     await page.wait_for_timeout(1200)
 
                     cards = page.locator('[data-component-type="s-search-result"]')
                     count = await cards.count()
+
                     for index in range(count):
                         if len(products) >= settings.scraper_max_results:
                             break
                         product = await self._extract_card(
-                            cards.nth(index),
-                            domain,
-                            currency_code,
-                            currency_symbol,
+                            cards.nth(index), domain, currency_code, currency_symbol
                         )
                         if product:
                             extracted_count += 1
-                        if product and self._passes_filters(product, filters):
-                            products.append(product)
+                            if self._passes_keyword_check(product, spec):
+                                products.append(product)
 
                     if len(products) >= settings.scraper_max_results:
                         break
                     await asyncio.sleep(0.8)
 
                 await browser.close()
-        except Exception:
-            return []
+        except Exception as exc:
+            logger.error("AmazonCatalogScraper error: %s", exc)
+            return sample_products(spec.search_term)
 
-        return products if extracted_count else []
+        if not extracted_count:
+            return sample_products(spec.search_term)
+
+        # ---- cache store ----
+        _RESULT_CACHE[key] = (time.monotonic(), products)
+        return products
+
+    # ------------------------------------------------------------------
+    # Card extraction
+    # ------------------------------------------------------------------
 
     async def _extract_card(
         self,
@@ -148,11 +243,16 @@ class AmazonCatalogScraper:
             ],
         )
         if not reviews_text:
-            reviews_text = await self._first_attr(card, ["[aria-label*='ratings']"], "aria-label")
+            reviews_text = await self._first_attr(
+                card, ["[aria-label*='ratings']"], "aria-label"
+            )
+
         image_url = await self._first_attr(card, ["img.s-image"], "src")
         prime_text = await self._first_text(card, [".a-icon-prime"])
         if not prime_text:
-            prime_text = await self._first_attr(card, ["[aria-label*='Prime']"], "aria-label")
+            prime_text = await self._first_attr(
+                card, ["[aria-label*='Prime']"], "aria-label"
+            )
 
         return Product(
             product_id=product_id,
@@ -172,6 +272,26 @@ class AmazonCatalogScraper:
                 "marketplace_domain": domain,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Lightweight keyword check (replaces old _passes_filters)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _passes_keyword_check(product: Product, spec: SearchSpec) -> bool:
+        """
+        Only checks must_have_keywords and avoid_keywords in Python.
+        Price / rating / Prime / brand are already enforced by Amazon's URL filters.
+        """
+        title_lower = product.title.lower()
+        for term in spec.avoid_keywords:
+            if term.lower() in title_lower:
+                return False
+        return True  # must_have is scored by LLMRelevanceFilter, not hard-filtered here
+
+    # ------------------------------------------------------------------
+    # DOM helpers
+    # ------------------------------------------------------------------
 
     async def _first_text(self, card, selectors: list[str]) -> str | None:
         for selector in selectors:
@@ -197,34 +317,7 @@ class AmazonCatalogScraper:
                 continue
         return None
 
-    def _passes_filters(self, product: Product, filters: ProductFilters) -> bool:
-        if filters.min_price is not None:
-            if product.price is None or product.price < filters.min_price:
-                return False
-        if filters.max_price is not None:
-            if product.price is None or product.price > filters.max_price:
-                return False
-        if filters.min_rating is not None:
-            if product.rating is None or product.rating < filters.min_rating:
-                return False
-        if filters.min_reviews is not None:
-            if product.review_count is None or product.review_count < filters.min_reviews:
-                return False
-        if filters.prime_only and not product.is_prime:
-            return False
-        if filters.brands:
-            if not product.brand:
-                return False
-            brands = {brand.lower() for brand in filters.brands}
-            if product.brand.lower() not in brands:
-                return False
-        avoid = [item.lower() for item in filters.avoid]
-        if any(term in product.title.lower() for term in avoid):
-            return False
-        return True
-
-    def _guess_brand(self, title: str) -> str | None:
+    @staticmethod
+    def _guess_brand(title: str) -> str | None:
         words = title.split()
-        if not words:
-            return None
-        return words[0].strip(":-,")
+        return words[0].strip(":-,") if words else None

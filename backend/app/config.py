@@ -16,11 +16,17 @@ class Settings(BaseModel):
     aws_region: str = "ap-south-1"
     dynamodb_table: str = "amazon-product-recommendations"
     use_dynamodb: bool = True
+    # Model used for recommendation explanations (response builder)
     bedrock_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    # Model used by the LLM Query Planner, Relevance Filter, and Ranker.
+    # Can point to a more capable model (e.g. Claude Sonnet) for better intent parsing.
+    query_planner_model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
     amazon_domain: str = "https://www.amazon.in"
     scraper_max_pages: int = Field(default=1, ge=1, le=5)
     scraper_max_results: int = Field(default=12, ge=1, le=48)
     scraper_timeout_ms: int = Field(default=25_000, ge=5_000, le=90_000)
+    # In-process scrape result cache TTL in seconds (0 = disabled)
+    query_cache_ttl_seconds: int = Field(default=300, ge=0)
     local_data_dir: Path = ROOT_DIR / "data"
 
 
@@ -55,6 +61,10 @@ def get_settings() -> Settings:
         bedrock_model_id=os.getenv(
             "BEDROCK_MODEL_ID", aws.get("bedrock_model_id", Settings().bedrock_model_id)
         ),
+        query_planner_model_id=os.getenv(
+            "QUERY_PLANNER_MODEL_ID",
+            aws.get("query_planner_model_id", Settings().query_planner_model_id),
+        ),
         amazon_domain=os.getenv(
             "AMAZON_DOMAIN", scraper.get("amazon_domain", Settings().amazon_domain)
         ).rstrip("/"),
@@ -71,6 +81,12 @@ def get_settings() -> Settings:
             os.getenv(
                 "SCRAPER_TIMEOUT_MS",
                 scraper.get("timeout_ms", Settings().scraper_timeout_ms),
+            )
+        ),
+        query_cache_ttl_seconds=int(
+            os.getenv(
+                "QUERY_CACHE_TTL_SECONDS",
+                scraper.get("query_cache_ttl_seconds", Settings().query_cache_ttl_seconds),
             )
         ),
     )
