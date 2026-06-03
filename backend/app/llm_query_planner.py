@@ -9,7 +9,7 @@ pipeline never hard-fails when Bedrock is unavailable.
 
 SearchSpec fields map directly to Amazon URL query parameters so that
 ALL major filters (price, rating, Prime, brand, sort) are applied on
-Amazon's search results page *before* Playwright loads any cards.
+Amazon's search results page *before* the MCP-controlled browser loads any cards.
 """
 
 import json

@@ -7,3 +7,4 @@ frontend/dist/
 data/*.json
 .env
 .DS_Store
+.playwright-mcp/

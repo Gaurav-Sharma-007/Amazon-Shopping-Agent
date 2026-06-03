@@ -111,7 +111,7 @@ def build_product_repository() -> ProductRepository:
 
 
 # ===========================================================================
-# Query Cache  (caches raw scrape results to avoid redundant Playwright calls)
+# Query Cache  (caches raw scrape results to avoid redundant browser calls)
 # ===========================================================================
 
 class QueryCache(ABC):

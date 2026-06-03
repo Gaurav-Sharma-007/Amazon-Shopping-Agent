@@ -16,10 +16,10 @@ LangGraph pipeline with six nodes:
 Key improvements over v1:
   - Intent is parsed by Bedrock Claude → SearchSpec (not regex).
   - All major filters (price, rating, Prime, brand, sort) are baked into the
-    Amazon search URL BEFORE Playwright loads any page.
+    Amazon search URL before the MCP-controlled browser loads any page.
   - A dedicated Bedrock call scores relevance of each card and drops junk.
   - A second Bedrock call ranks the remaining products with explicit reasoning.
-  - Result cache (DynamoDB or in-process) avoids redundant Playwright calls.
+  - Result cache (DynamoDB or in-process) avoids redundant browser calls.
 """
 
 import logging
@@ -229,7 +229,7 @@ class ProductRecommendationGraph:
             self.query_cache.put(key, products, settings.query_cache_ttl_seconds)
             trace.append(
                 f"Scraping agent: scraped {len(products)} products from Amazon "
-                f"with native URL filters."
+                f"with native URL filters via Playwright MCP."
             )
 
         return {

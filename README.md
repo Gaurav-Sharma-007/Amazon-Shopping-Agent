@@ -15,7 +15,7 @@ User message
     │
     ▼  [Orchestrator]       Loads session memory, appends message
     ▼  [Intent Agent]       Bedrock LLM → SearchSpec JSON (regex fallback)
-    ▼  [Scraping Agent]     Playwright + native Amazon URL filters + TTL cache
+    ▼  [Scraping Agent]     Playwright MCP + native Amazon URL filters + TTL cache
     ▼  [Relevance Filter]   Bedrock LLM scores each product 0-10, drops irrelevant ones
     ▼  [Ranking Agent]      Bedrock LLM ranks by value/intent fit/quality with reasoning
     ▼  [Database Agent]     Saves ranked products to DynamoDB (or local JSON)
@@ -25,13 +25,16 @@ User message
 ### Key Design Decisions
 
 - **Filters applied on Amazon's page** — price, rating, Prime, brand and sort are encoded
-  directly in the Amazon SERP URL (`p_36`, `p_72`, `p_85`, `p_89`, `s`) before Playwright
+  directly in the Amazon SERP URL (`p_36`, `p_72`, `p_85`, `p_89`, `s`) before the browser
   loads any results. No post-scrape Python filtering.
 - **LLM at every intelligence layer** — intent parsing, relevance scoring and ranking all
   use Bedrock. Every LLM call has a deterministic fallback so the pipeline never crashes
   when Bedrock is unreachable.
+- **Playwright MCP browser automation** — the scraper talks to `@playwright/mcp`
+  through the MCP Python SDK, keeping browser control behind an MCP server rather
+  than the local Playwright Python API.
 - **Result cache** — identical search specs are served from DynamoDB (or an in-process
-  dict) for a configurable TTL, avoiding redundant Playwright round-trips.
+  dict) for a configurable TTL, avoiding redundant browser round-trips.
 
 ### File Map
 
@@ -42,7 +45,7 @@ backend/app/
 ├── llm_relevance_filter.py LLM relevance scoring per product (0-10)
 ├── llm_ranker.py           LLM ranking with value/intent/quality axes
 ├── llm.py                  Recommendation LLM (response builder)
-├── scraper.py              Playwright scraper + URL builder
+├── scraper.py              Playwright MCP scraper + URL builder
 ├── models.py               Pydantic models (SearchSpec, AmazonURLFilters …)
 ├── storage.py              DynamoDB + local JSON + QueryCache
 ├── memory.py               Session memory (JSON-backed)
@@ -64,8 +67,11 @@ frontend/src/
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
 ```
+
+The scraper starts the Playwright MCP server with `npx @playwright/mcp@latest`, so
+Node.js / npm must be available on the backend machine. The first scrape may take
+a moment while `npx` resolves the package.
 
 ### Frontend
 
@@ -309,11 +315,11 @@ Or open **AWS Console → Amazon Bedrock → Model access** in `us-east-1`.
 
 ## Scraping Notes
 
-The Playwright scraper reads only **public** Amazon search result pages for the selected
-marketplace. It does not log in, bypass captcha, or circumvent access controls.
+The Playwright MCP scraper reads only **public** Amazon search result pages for the
+selected marketplace. It does not log in, bypass captcha, or circumvent access controls.
 
 Filters (price, star rating, Prime, brand, sort) are encoded in the Amazon SERP URL itself
 before any page is loaded — Amazon's own backend applies them server-side.
 
-In development, if Playwright or Amazon access fails, the backend returns deterministic
+In development, if Playwright MCP or Amazon access fails, the backend returns deterministic
 sample products so the full agent, ranking, memory, and UI flow remains testable.
